@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://my-portfolio-api-2x2a.onrender.com/api/:path*"
+    },
+    {
+      "source": "/uploads/:path*",
+      "destination": "https://my-portfolio-api-2x2a.onrender.com/uploads/:path*"
+    }
+  ]
+}
