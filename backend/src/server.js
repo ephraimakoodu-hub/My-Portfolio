@@ -7,7 +7,7 @@ const cookieParser = require('cookie-parser');
 const { buildHelmet, buildCors } = require('./middleware/security');
 const { issueCsrfCookie, verifyCsrf } = require('./middleware/csrf');
 const { generalApiLimiter } = require('./middleware/rateLimit');
-const { UPLOAD_ROOT } = require('./middleware/upload');
+
 
 const REQUIRED_ENV = ['JWT_SECRET', 'FRONTEND_URL'];
 
@@ -34,17 +34,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(issueCsrfCookie);
 app.use(generalApiLimiter);
 
-// Static uploaded images
-app.use(
-  '/uploads',
-  express.static(UPLOAD_ROOT, {
-    maxAge: '30d',
 
-    setHeaders(res) {
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-    },
-  })
-);
 
 // Health check
 app.get('/api/health', (req, res) => {

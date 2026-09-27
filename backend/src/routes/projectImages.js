@@ -55,10 +55,10 @@ router.post(
 
     try {
       for (const file of req.files) {
-        const { relativePath } = await processAndSaveImage(
-          file.buffer,
-          SUBDIR
-        );
+       const { publicUrl } = await processAndSaveImage(
+  file.buffer,
+  SUBDIR
+);
 
         const result = await db.query(
           `
@@ -86,7 +86,7 @@ router.post(
           `,
           [
             project.id,
-            relativePath,
+            publicUrl,
             '',
             '',
             project.id

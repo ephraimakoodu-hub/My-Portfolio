@@ -1,8 +1,7 @@
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const sharp = require('sharp');
+const { createClient } = require('@supabase/supabase-js');
 
 const MAX_BYTES =
   Number(process.env.MAX_UPLOAD_MB || 8) * 1024 * 1024;
@@ -13,24 +12,23 @@ const ALLOWED_MIME = new Set([
   'image/webp',
 ]);
 
-const UPLOAD_ROOT = path.resolve(
-  process.cwd(),
-  process.env.UPLOAD_DIR || './uploads'
+const BUCKET = 'uploads';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Memory storage only: we never trust or write the client-supplied file
-// straight to disk. We inspect the real bytes first, then re-encode the
-// image ourselves.
+// Memory storage only.
 const upload = multer({
   storage: multer.memoryStorage(),
+
   limits: {
     fileSize: MAX_BYTES,
     files: 20,
   },
 
   fileFilter(req, file, cb) {
-    // Cheap first pass using the declared MIME type.
-    // The real validation happens in processAndSaveImage().
     if (!ALLOWED_MIME.has(file.mimetype)) {
       return cb(
         new Error('Only JPEG, PNG or WEBP images are allowed.')
@@ -41,19 +39,17 @@ const upload = multer({
   },
 });
 
-function safeFilename(ext) {
+function safeFilename() {
   return `${Date.now()}-${crypto
     .randomBytes(12)
-    .toString('hex')}.${ext}`;
+    .toString('hex')}.webp`;
 }
 
 /**
- * Validates a single uploaded file's real content using magic bytes,
- * then re-encodes it with sharp and saves it as WebP.
+ * Validates the real file content, converts it to WebP,
+ * then uploads it to Supabase Storage.
  */
 async function processAndSaveImage(fileBuffer, subDir) {
-  // file-type is ESM, so we load it dynamically inside this
-  // CommonJS async function.
   const { fileTypeFromBuffer } = await import('file-type');
 
   const detected = await fileTypeFromBuffer(fileBuffer);
@@ -64,22 +60,12 @@ async function processAndSaveImage(fileBuffer, subDir) {
     );
   }
 
-  const destDir = path.join(UPLOAD_ROOT, subDir);
+  const filename = safeFilename();
 
-  fs.mkdirSync(destDir, {
-    recursive: true,
-  });
+  const storagePath = `${subDir}/${filename}`;
 
-  const filename = safeFilename('webp');
-
-  const destPath = path.join(
-    destDir,
-    filename
-  );
-
-  // Re-encode through sharp to normalize the image and remove
-  // embedded metadata/non-image payloads.
-  await sharp(fileBuffer)
+  // Convert and optimize the image in memory.
+  const optimizedBuffer = await sharp(fileBuffer)
     .rotate()
     .resize({
       width: 1920,
@@ -88,33 +74,63 @@ async function processAndSaveImage(fileBuffer, subDir) {
     .webp({
       quality: 82,
     })
-    .toFile(destPath);
+    .toBuffer();
+
+  const { error } = await supabase.storage
+    .from(BUCKET)
+    .upload(storagePath, optimizedBuffer, {
+      contentType: 'image/webp',
+      cacheControl: '2592000',
+      upsert: false,
+    });
+
+  if (error) {
+    console.error('Supabase Storage upload error:', error);
+    throw new Error('Failed to upload image.');
+  }
+
+  const {
+    data: { publicUrl },
+  } = supabase.storage
+    .from(BUCKET)
+    .getPublicUrl(storagePath);
 
   return {
     filename,
-    relativePath: path.posix.join(
-      subDir,
-      filename
-    ),
+    relativePath: storagePath,
+    publicUrl,
   };
 }
 
-function deleteImageFile(subDir, filename) {
+/**
+ * Deletes an image from Supabase Storage.
+ */
+async function deleteImageFile(subDir, filename) {
   if (!filename) return;
 
-  const p = path.join(
-    UPLOAD_ROOT,
-    subDir,
-    path.basename(filename)
-  );
+  const cleanFilename = filename
+    .replace(/^\/+/, '')
+    .split('/')
+    .pop();
 
-  // Best-effort deletion; missing files are not treated as errors.
-  fs.unlink(p, () => {});
+  if (!cleanFilename) return;
+
+  const storagePath = `${subDir}/${cleanFilename}`;
+
+  const { error } = await supabase.storage
+    .from(BUCKET)
+    .remove([storagePath]);
+
+  if (error) {
+    console.error(
+      'Supabase Storage delete error:',
+      error
+    );
+  }
 }
 
 module.exports = {
   upload,
   processAndSaveImage,
   deleteImageFile,
-  UPLOAD_ROOT,
 };

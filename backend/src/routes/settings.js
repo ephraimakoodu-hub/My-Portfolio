@@ -189,6 +189,11 @@ router.post(
         SUBDIR
       );
     } catch (err) {
+      console.error(
+        'Profile image processing error:',
+        err
+      );
+
       return res.status(400).json({
         error:
           err.message ||
@@ -205,6 +210,7 @@ router.post(
         `
       );
 
+      // Save the Supabase public URL.
       const result = await db.query(
         `
         UPDATE settings
@@ -214,7 +220,7 @@ router.post(
         WHERE id = 1
         RETURNING profile_image
         `,
-        [saved.relativePath]
+        [saved.publicUrl]
       );
 
       if (result.rowCount === 0) {
@@ -223,27 +229,34 @@ router.post(
         });
       }
 
+      // Delete the previous image from Supabase Storage.
       if (
         previous &&
         previous.profile_image
       ) {
-        deleteImageFile(
+        await deleteImageFile(
           SUBDIR,
           previous.profile_image
-            .split('/')
-            .pop()
         );
       }
 
       res.json({
-        profile_image:
-          saved.relativePath
+        profile_image: saved.publicUrl
       });
     } catch (error) {
       console.error(
         'Profile image update error:',
         error
       );
+
+      // If the database update failed after the new
+      // image was uploaded, remove the new image too.
+      if (saved && saved.filename) {
+        await deleteImageFile(
+          SUBDIR,
+          saved.filename
+        );
+      }
 
       res.status(500).json({
         error:
