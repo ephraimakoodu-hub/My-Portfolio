@@ -1,245 +1,735 @@
 const express = require('express');
 const slugify = require('slugify');
 const { body, validationResult } = require('express-validator');
+
 const db = require('../db/db');
+
 const { requireAdmin } = require('../middleware/auth');
 const { sanitizeFields } = require('../utils/sanitize');
 
 const router = express.Router();
 
 const TEXT_FIELDS = [
-  'title', 'short_description', 'full_description', 'project_url', 'github_url',
-  'case_study_url', 'project_date', 'client_type', 'challenges', 'solution',
-  'results', 'seo_title', 'seo_description',
+  'title',
+  'short_description',
+  'full_description',
+  'project_url',
+  'github_url',
+  'case_study_url',
+  'project_date',
+  'client_type',
+  'challenges',
+  'solution',
+  'results',
+  'seo_title',
+  'seo_description',
 ];
 
-// better-sqlite3 rejects `undefined` bind values (it only accepts values
-// that are actually present), so any optional text field the client didn't
-// send needs an explicit empty-string default before it reaches a query.
 function withTextDefaults(obj) {
   const out = { ...obj };
+
   for (const f of TEXT_FIELDS) {
-    if (out[f] === undefined || out[f] === null) out[f] = '';
+    if (out[f] === undefined || out[f] === null) {
+      out[f] = '';
+    }
   }
+
   return out;
 }
 
-function attachRelations(project) {
-  const technologies = db
-    .prepare(
-      `SELECT t.* FROM technologies t
-       JOIN project_technologies pt ON pt.technology_id = t.id
-       WHERE pt.project_id = ? ORDER BY t.name ASC`
-    )
-    .all(project.id);
-  const features = db
-    .prepare('SELECT * FROM project_features WHERE project_id = ? ORDER BY display_order ASC, id ASC')
-    .all(project.id);
-  const images = db
-    .prepare('SELECT * FROM project_images WHERE project_id = ? ORDER BY display_order ASC, id ASC')
-    .all(project.id);
-  const category = project.category_id
-    ? db.prepare('SELECT * FROM categories WHERE id = ?').get(project.category_id)
-    : null;
-  return { ...project, technologies, features, images, category };
+async function attachRelations(project) {
+  const technologies = await db.all(
+    `
+    SELECT t.*
+    FROM technologies t
+    JOIN project_technologies pt
+      ON pt.technology_id = t.id
+    WHERE pt.project_id = $1
+    ORDER BY t.name ASC
+    `,
+    [project.id]
+  );
+
+  const features = await db.all(
+    `
+    SELECT *
+    FROM project_features
+    WHERE project_id = $1
+    ORDER BY display_order ASC, id ASC
+    `,
+    [project.id]
+  );
+
+  const images = await db.all(
+    `
+    SELECT *
+    FROM project_images
+    WHERE project_id = $1
+    ORDER BY display_order ASC, id ASC
+    `,
+    [project.id]
+  );
+
+  let category = null;
+
+  if (project.category_id) {
+    category = await db.get(
+      'SELECT * FROM categories WHERE id = $1',
+      [project.category_id]
+    );
+  }
+
+  return {
+    ...project,
+    technologies,
+    features,
+    images,
+    category,
+  };
 }
 
-function uniqueSlug(title, ignoreId) {
-  const base = slugify(title, { lower: true, strict: true }) || 'project';
+async function uniqueSlug(title, ignoreId = null) {
+  const base =
+    slugify(title, {
+      lower: true,
+      strict: true,
+    }) || 'project';
+
   let slug = base;
   let n = 1;
+
   while (true) {
-    const existing = db.prepare('SELECT id FROM projects WHERE slug = ?').get(slug);
-    if (!existing || existing.id === ignoreId) return slug;
+    const existing = await db.get(
+      'SELECT id FROM projects WHERE slug = $1',
+      [slug]
+    );
+
+    if (!existing || existing.id === Number(ignoreId)) {
+      return slug;
+    }
+
     n += 1;
     slug = `${base}-${n}`;
   }
 }
 
-function replaceTechnologies(projectId, technologyIds) {
-  db.prepare('DELETE FROM project_technologies WHERE project_id = ?').run(projectId);
-  const insert = db.prepare('INSERT OR IGNORE INTO project_technologies (project_id, technology_id) VALUES (?, ?)');
-  (technologyIds || []).forEach((tid) => insert.run(projectId, tid));
+async function replaceTechnologies(projectId, technologyIds) {
+  await db.query(
+    'DELETE FROM project_technologies WHERE project_id = $1',
+    [projectId]
+  );
+
+  for (const tid of technologyIds || []) {
+    await db.query(
+      `
+      INSERT INTO project_technologies
+      (project_id, technology_id)
+      VALUES ($1, $2)
+      ON CONFLICT (project_id, technology_id) DO NOTHING
+      `,
+      [projectId, tid]
+    );
+  }
 }
 
-function replaceFeatures(projectId, features) {
-  db.prepare('DELETE FROM project_features WHERE project_id = ?').run(projectId);
-  const insert = db.prepare('INSERT INTO project_features (project_id, feature_text, display_order) VALUES (?, ?, ?)');
-  (features || []).forEach((text, idx) => {
+async function replaceFeatures(projectId, features) {
+  await db.query(
+    'DELETE FROM project_features WHERE project_id = $1',
+    [projectId]
+  );
+
+  let displayOrder = 0;
+
+  for (const text of features || []) {
     const clean = String(text || '').trim();
-    if (clean) insert.run(projectId, clean, idx);
-  });
+
+    if (clean) {
+      await db.query(
+        `
+        INSERT INTO project_features
+        (project_id, feature_text, display_order)
+        VALUES ($1, $2, $3)
+        `,
+        [
+          projectId,
+          clean,
+          displayOrder,
+        ]
+      );
+
+      displayOrder++;
+    }
+  }
 }
 
 // ---------- PUBLIC ----------
 
-router.get('/', (req, res) => {
-  const { category, featured } = req.query;
-  let sql = "SELECT * FROM projects WHERE status = 'published'";
-  const params = [];
-  if (category) {
-    sql += ' AND category_id = (SELECT id FROM categories WHERE slug = ?)';
-    params.push(category);
+// Get published projects
+router.get('/', async (req, res) => {
+  try {
+    const { category, featured } = req.query;
+
+    let sql = `
+      SELECT *
+      FROM projects
+      WHERE status = 'published'
+    `;
+
+    const params = [];
+
+    if (category) {
+      params.push(category);
+
+      sql += `
+        AND category_id = (
+          SELECT id
+          FROM categories
+          WHERE slug = $${params.length}
+        )
+      `;
+    }
+
+    if (featured === 'true') {
+      sql += ' AND featured = 1';
+    }
+
+    sql += `
+      ORDER BY display_order ASC, created_at DESC
+    `;
+
+    const rows = await db.all(sql, params);
+
+    const projects = await Promise.all(
+      rows.map(attachRelations)
+    );
+
+    res.json(projects);
+  } catch (error) {
+    console.error('Get public projects error:', error);
+
+    res.status(500).json({
+      error: 'Failed to load projects.',
+    });
   }
-  if (featured === 'true') {
-    sql += ' AND featured = 1';
-  }
-  sql += ' ORDER BY display_order ASC, created_at DESC';
-  const rows = db.prepare(sql).all(...params);
-  res.json(rows.map(attachRelations));
 });
 
-router.get('/slug/:slug', (req, res) => {
-  const project = db.prepare("SELECT * FROM projects WHERE slug = ? AND status = 'published'").get(req.params.slug);
-  if (!project) return res.status(404).json({ error: 'Project not found.' });
-  res.json(attachRelations(project));
+// Get published project by slug
+router.get('/slug/:slug', async (req, res) => {
+  try {
+    const project = await db.get(
+      `
+      SELECT *
+      FROM projects
+      WHERE slug = $1
+        AND status = 'published'
+      `,
+      [req.params.slug]
+    );
+
+    if (!project) {
+      return res.status(404).json({
+        error: 'Project not found.',
+      });
+    }
+
+    res.json(await attachRelations(project));
+  } catch (error) {
+    console.error('Get project by slug error:', error);
+
+    res.status(500).json({
+      error: 'Failed to load project.',
+    });
+  }
 });
 
 // ---------- ADMIN ----------
 
-router.get('/admin', requireAdmin, (req, res) => {
-  const { status, category_id, featured, search } = req.query;
-  let sql = 'SELECT * FROM projects WHERE 1=1';
-  const params = [];
-  if (status) {
-    sql += ' AND status = ?';
-    params.push(status);
+// Get all projects for admin
+router.get('/admin', requireAdmin, async (req, res) => {
+  try {
+    const {
+      status,
+      category_id,
+      featured,
+      search,
+    } = req.query;
+
+    let sql = `
+      SELECT *
+      FROM projects
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (status) {
+      params.push(status);
+      sql += ` AND status = $${params.length}`;
+    }
+
+    if (category_id) {
+      params.push(category_id);
+      sql += ` AND category_id = $${params.length}`;
+    }
+
+    if (
+      featured === 'true' ||
+      featured === 'false'
+    ) {
+      params.push(featured === 'true' ? 1 : 0);
+      sql += ` AND featured = $${params.length}`;
+    }
+
+    if (search) {
+      params.push(`%${search}%`);
+      sql += ` AND title ILIKE $${params.length}`;
+    }
+
+    sql += `
+      ORDER BY display_order ASC, created_at DESC
+    `;
+
+    const rows = await db.all(sql, params);
+
+    const projects = await Promise.all(
+      rows.map(attachRelations)
+    );
+
+    res.json(projects);
+  } catch (error) {
+    console.error('Get admin projects error:', error);
+
+    res.status(500).json({
+      error: 'Failed to load projects.',
+    });
   }
-  if (category_id) {
-    sql += ' AND category_id = ?';
-    params.push(category_id);
-  }
-  if (featured === 'true' || featured === 'false') {
-    sql += ' AND featured = ?';
-    params.push(featured === 'true' ? 1 : 0);
-  }
-  if (search) {
-    sql += ' AND title LIKE ?';
-    params.push(`%${search}%`);
-  }
-  sql += ' ORDER BY display_order ASC, created_at DESC';
-  const rows = db.prepare(sql).all(...params);
-  res.json(rows.map(attachRelations));
 });
 
-router.get('/admin/:id', requireAdmin, (req, res) => {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  if (!project) return res.status(404).json({ error: 'Project not found.' });
-  res.json(attachRelations(project));
+// Get one project for admin
+router.get('/admin/:id', requireAdmin, async (req, res) => {
+  try {
+    const project = await db.get(
+      'SELECT * FROM projects WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (!project) {
+      return res.status(404).json({
+        error: 'Project not found.',
+      });
+    }
+
+    res.json(await attachRelations(project));
+  } catch (error) {
+    console.error('Get admin project error:', error);
+
+    res.status(500).json({
+      error: 'Failed to load project.',
+    });
+  }
 });
 
+// Create project
 router.post(
   '/admin',
   requireAdmin,
-  [body('title').trim().isLength({ min: 1, max: 150 })],
-  (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: 'A project title is required.' });
+  [
+    body('title')
+      .trim()
+      .isLength({ min: 1, max: 150 }),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
 
-    const clean = withTextDefaults(sanitizeFields(req.body, TEXT_FIELDS));
-    const slug = uniqueSlug(clean.title);
-    const status = ['draft', 'published', 'archived'].includes(req.body.status) ? req.body.status : 'draft';
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'A project title is required.',
+        });
+      }
 
-    const info = db
-      .prepare(
-        `INSERT INTO projects
-        (title, slug, short_description, full_description, category_id, status, featured,
-         project_url, github_url, case_study_url, project_date, client_type, challenges,
-         solution, results, seo_title, seo_description,
-         display_order)
-        VALUES (@title, @slug, @short_description, @full_description, @category_id, @status, @featured,
-         @project_url, @github_url, @case_study_url, @project_date, @client_type, @challenges,
-         @solution, @results, @seo_title, @seo_description,
-         (SELECT COALESCE(MAX(display_order),0)+1 FROM projects))`
-      )
-      .run({
-        ...clean,
-        slug,
-        status,
-        featured: req.body.featured ? 1 : 0,
-        category_id: req.body.category_id || null,
+      const clean = withTextDefaults(
+        sanitizeFields(req.body, TEXT_FIELDS)
+      );
+
+      const slug = await uniqueSlug(clean.title);
+
+      const status = [
+        'draft',
+        'published',
+        'archived',
+      ].includes(req.body.status)
+        ? req.body.status
+        : 'draft';
+
+      const result = await db.query(
+        `
+        INSERT INTO projects
+        (
+          title,
+          slug,
+          short_description,
+          full_description,
+          category_id,
+          status,
+          featured,
+          project_url,
+          github_url,
+          case_study_url,
+          project_date,
+          client_type,
+          challenges,
+          solution,
+          results,
+          seo_title,
+          seo_description,
+          display_order
+        )
+        VALUES
+        (
+          $1, $2, $3, $4, $5, $6, $7,
+          $8, $9, $10, $11, $12, $13, $14,
+          $15, $16, $17,
+          (
+            SELECT COALESCE(MAX(display_order), 0) + 1
+            FROM projects
+          )
+        )
+        RETURNING *
+        `,
+        [
+          clean.title,
+          slug,
+          clean.short_description,
+          clean.full_description,
+          req.body.category_id || null,
+          status,
+          req.body.featured ? 1 : 0,
+          clean.project_url,
+          clean.github_url,
+          clean.case_study_url,
+          clean.project_date,
+          clean.client_type,
+          clean.challenges,
+          clean.solution,
+          clean.results,
+          clean.seo_title,
+          clean.seo_description,
+        ]
+      );
+
+      const project = result.rows[0];
+
+      await replaceTechnologies(
+        project.id,
+        req.body.technology_ids
+      );
+
+      await replaceFeatures(
+        project.id,
+        req.body.features
+      );
+
+      const finalProject = await db.get(
+        'SELECT * FROM projects WHERE id = $1',
+        [project.id]
+      );
+
+      res.status(201).json(
+        await attachRelations(finalProject)
+      );
+    } catch (error) {
+      console.error('Create project error:', error);
+
+      res.status(500).json({
+        error: 'Failed to create project.',
       });
-
-    const projectId = info.lastInsertRowid;
-    replaceTechnologies(projectId, req.body.technology_ids);
-    replaceFeatures(projectId, req.body.features);
-
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-    res.status(201).json(attachRelations(project));
+    }
   }
 );
 
+// Update project
 router.put(
   '/admin/:id',
   requireAdmin,
-  [body('title').trim().isLength({ min: 1, max: 150 })],
-  (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ error: 'A project title is required.' });
+  [
+    body('title')
+      .trim()
+      .isLength({ min: 1, max: 150 }),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
 
-    const existing = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ error: 'Project not found.' });
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'A project title is required.',
+        });
+      }
 
-    const clean = withTextDefaults(sanitizeFields(req.body, TEXT_FIELDS));
-    const slug = clean.title !== existing.title ? uniqueSlug(clean.title, existing.id) : existing.slug;
-    const status = ['draft', 'published', 'archived'].includes(req.body.status) ? req.body.status : existing.status;
+      const existing = await db.get(
+        'SELECT * FROM projects WHERE id = $1',
+        [req.params.id]
+      );
 
-    db.prepare(
-      `UPDATE projects SET
-        title=@title, slug=@slug, short_description=@short_description, full_description=@full_description,
-        category_id=@category_id, status=@status, featured=@featured, project_url=@project_url,
-        github_url=@github_url, case_study_url=@case_study_url, project_date=@project_date,
-        client_type=@client_type, challenges=@challenges, solution=@solution, results=@results,
-        seo_title=@seo_title, seo_description=@seo_description, updated_at=datetime('now')
-       WHERE id=@id`
-    ).run({
-      ...clean,
-      slug,
-      status,
-      featured: req.body.featured ? 1 : 0,
-      category_id: req.body.category_id || null,
-      id: existing.id,
-    });
+      if (!existing) {
+        return res.status(404).json({
+          error: 'Project not found.',
+        });
+      }
 
-    replaceTechnologies(existing.id, req.body.technology_ids);
-    if (req.body.features !== undefined) replaceFeatures(existing.id, req.body.features);
+      const clean = withTextDefaults(
+        sanitizeFields(req.body, TEXT_FIELDS)
+      );
 
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(existing.id);
-    res.json(attachRelations(project));
+      const slug =
+        clean.title !== existing.title
+          ? await uniqueSlug(
+              clean.title,
+              existing.id
+            )
+          : existing.slug;
+
+      const status = [
+        'draft',
+        'published',
+        'archived',
+      ].includes(req.body.status)
+        ? req.body.status
+        : existing.status;
+
+      const result = await db.query(
+        `
+        UPDATE projects
+        SET
+          title = $1,
+          slug = $2,
+          short_description = $3,
+          full_description = $4,
+          category_id = $5,
+          status = $6,
+          featured = $7,
+          project_url = $8,
+          github_url = $9,
+          case_study_url = $10,
+          project_date = $11,
+          client_type = $12,
+          challenges = $13,
+          solution = $14,
+          results = $15,
+          seo_title = $16,
+          seo_description = $17,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $18
+        RETURNING *
+        `,
+        [
+          clean.title,
+          slug,
+          clean.short_description,
+          clean.full_description,
+          req.body.category_id || null,
+          status,
+          req.body.featured ? 1 : 0,
+          clean.project_url,
+          clean.github_url,
+          clean.case_study_url,
+          clean.project_date,
+          clean.client_type,
+          clean.challenges,
+          clean.solution,
+          clean.results,
+          clean.seo_title,
+          clean.seo_description,
+          existing.id,
+        ]
+      );
+
+      const project = result.rows[0];
+
+      await replaceTechnologies(
+        existing.id,
+        req.body.technology_ids
+      );
+
+      if (req.body.features !== undefined) {
+        await replaceFeatures(
+          existing.id,
+          req.body.features
+        );
+      }
+
+      res.json(
+        await attachRelations(project)
+      );
+    } catch (error) {
+      console.error('Update project error:', error);
+
+      res.status(500).json({
+        error: 'Failed to update project.',
+      });
+    }
   }
 );
 
-router.patch('/admin/:id/status', requireAdmin, [body('status').isIn(['draft', 'published', 'archived'])], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: 'Invalid status value.' });
-  const result = db
-    .prepare("UPDATE projects SET status = ?, updated_at = datetime('now') WHERE id = ?")
-    .run(req.body.status, req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Project not found.' });
-  res.json(attachRelations(db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)));
-});
+// Change project status
+router.patch(
+  '/admin/:id/status',
+  requireAdmin,
+  [
+    body('status').isIn([
+      'draft',
+      'published',
+      'archived',
+    ]),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
 
-router.put('/admin/reorder', requireAdmin, [body('order').isArray({ min: 1 })], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: 'An order array of project ids is required.' });
-  const update = db.prepare('UPDATE projects SET display_order = ? WHERE id = ?');
-  const tx = db.transaction((ids) => {
-    ids.forEach((id, idx) => update.run(idx, id));
-  });
-  tx(req.body.order);
-  res.json({ ok: true });
-});
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'Invalid status value.',
+        });
+      }
 
-router.delete('/admin/:id', requireAdmin, (req, res) => {
-  // Soft delete by default: archiving preserves assets and history.
-  // Hard delete only when explicitly confirmed via ?permanent=true.
-  if (req.query.permanent === 'true') {
-    db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
-    return res.json({ ok: true, permanent: true });
+      const result = await db.query(
+        `
+        UPDATE projects
+        SET
+          status = $1,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        RETURNING *
+        `,
+        [
+          req.body.status,
+          req.params.id,
+        ]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          error: 'Project not found.',
+        });
+      }
+
+      res.json(
+        await attachRelations(result.rows[0])
+      );
+    } catch (error) {
+      console.error('Change project status error:', error);
+
+      res.status(500).json({
+        error: 'Failed to update project status.',
+      });
+    }
   }
-  const result = db.prepare("UPDATE projects SET status='archived', updated_at=datetime('now') WHERE id = ?").run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Project not found.' });
-  res.json({ ok: true, permanent: false });
-});
+);
+
+// Reorder projects
+router.put(
+  '/admin/reorder',
+  requireAdmin,
+  [
+    body('order').isArray({ min: 1 }),
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'An order array of project ids is required.',
+        });
+      }
+
+      await db.transaction(async (client) => {
+        for (
+          let idx = 0;
+          idx < req.body.order.length;
+          idx++
+        ) {
+          await client.query(
+            `
+            UPDATE projects
+            SET display_order = $1
+            WHERE id = $2
+            `,
+            [
+              idx,
+              req.body.order[idx],
+            ]
+          );
+        }
+      });
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('Reorder projects error:', error);
+
+      res.status(500).json({
+        error: 'Failed to reorder projects.',
+      });
+    }
+  }
+);
+
+// Delete/archive project
+router.delete(
+  '/admin/:id',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      // Hard delete only when explicitly confirmed.
+      if (req.query.permanent === 'true') {
+        const result = await db.query(
+          'DELETE FROM projects WHERE id = $1',
+          [req.params.id]
+        );
+
+        if (result.rowCount === 0) {
+          return res.status(404).json({
+            error: 'Project not found.',
+          });
+        }
+
+        return res.json({
+          ok: true,
+          permanent: true,
+        });
+      }
+
+      const result = await db.query(
+        `
+        UPDATE projects
+        SET
+          status = 'archived',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        RETURNING *
+        `,
+        [req.params.id]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          error: 'Project not found.',
+        });
+      }
+
+      res.json({
+        ok: true,
+        permanent: false,
+      });
+    } catch (error) {
+      console.error('Delete project error:', error);
+
+      res.status(500).json({
+        error: 'Failed to delete project.',
+      });
+    }
+  }
+);
 
 module.exports = router;

@@ -1,106 +1,428 @@
 const express = require('express');
+
 const { body, validationResult } = require('express-validator');
+
 const db = require('../db/db');
+
 const { requireAdmin } = require('../middleware/auth');
-const { upload, processAndSaveImage, deleteImageFile } = require('../middleware/upload');
+
+const {
+  upload,
+  processAndSaveImage,
+  deleteImageFile
+} = require('../middleware/upload');
+
 const { uploadLimiter } = require('../middleware/rateLimit');
+
 const { sanitizeFields } = require('../utils/sanitize');
 
 const router = express.Router({ mergeParams: true });
+
 const SUBDIR = 'projects';
 
-function assertProjectExists(projectId, res) {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+async function assertProjectExists(projectId, res) {
+  const project = await db.get(
+    'SELECT * FROM projects WHERE id = $1',
+    [projectId]
+  );
+
   if (!project) {
     res.status(404).json({ error: 'Project not found.' });
     return null;
   }
+
   return project;
 }
 
-router.post('/', requireAdmin, uploadLimiter, upload.array('images', 20), async (req, res) => {
-  const project = assertProjectExists(req.params.projectId, res);
-  if (!project) return;
-  if (!req.files || req.files.length === 0) {
-    return res.status(400).json({ error: 'No image files were provided.' });
-  }
+// Upload project images
+router.post(
+  '/',
+  requireAdmin,
+  uploadLimiter,
+  upload.array('images', 20),
+  async (req, res) => {
+    const project = await assertProjectExists(req.params.projectId, res);
 
-  const insert = db.prepare(
-    'INSERT INTO project_images (project_id, filename, alt_text, caption, display_order) VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(display_order),0)+1 FROM project_images WHERE project_id = ?))'
-  );
+    if (!project) return;
 
-  const saved = [];
-  try {
-    for (const file of req.files) {
-      const { relativePath } = await processAndSaveImage(file.buffer, SUBDIR);
-      const info = insert.run(project.id, relativePath, '', '', project.id);
-      saved.push(db.prepare('SELECT * FROM project_images WHERE id = ?').get(info.lastInsertRowid));
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        error: 'No image files were provided.'
+      });
     }
-  } catch (err) {
-    return res.status(400).json({ error: err.message || 'One or more files were not valid images.' });
+
+    const saved = [];
+
+    try {
+      for (const file of req.files) {
+        const { relativePath } = await processAndSaveImage(
+          file.buffer,
+          SUBDIR
+        );
+
+        const result = await db.query(
+          `
+          INSERT INTO project_images
+          (
+            project_id,
+            filename,
+            alt_text,
+            caption,
+            display_order
+          )
+          VALUES
+          (
+            $1,
+            $2,
+            $3,
+            $4,
+            (
+              SELECT COALESCE(MAX(display_order), 0) + 1
+              FROM project_images
+              WHERE project_id = $5
+            )
+          )
+          RETURNING *
+          `,
+          [
+            project.id,
+            relativePath,
+            '',
+            '',
+            project.id
+          ]
+        );
+
+        saved.push(result.rows[0]);
+      }
+    } catch (err) {
+      return res.status(400).json({
+        error:
+          err.message ||
+          'One or more files were not valid images.'
+      });
+    }
+
+    // First image ever added becomes the cover automatically
+    // if no cover currently exists.
+    const hasCover = await db.get(
+      `
+      SELECT id
+      FROM project_images
+      WHERE project_id = $1
+        AND is_cover = 1
+      `,
+      [project.id]
+    );
+
+    if (!hasCover && saved.length > 0) {
+      await db.query(
+        `
+        UPDATE project_images
+        SET is_cover = 1
+        WHERE id = $1
+        `,
+        [saved[0].id]
+      );
+
+      await db.query(
+        `
+        UPDATE projects
+        SET cover_image = $1
+        WHERE id = $2
+        `,
+        [
+          saved[0].filename,
+          project.id
+        ]
+      );
+    }
+
+    const images = await db.all(
+      `
+      SELECT *
+      FROM project_images
+      WHERE project_id = $1
+      ORDER BY display_order ASC
+      `,
+      [project.id]
+    );
+
+    res.status(201).json(images);
   }
+);
 
-  // First image ever added becomes the cover automatically if none is set.
-  const hasCover = db.prepare('SELECT id FROM project_images WHERE project_id = ? AND is_cover = 1').get(project.id);
-  if (!hasCover && saved.length > 0) {
-    db.prepare('UPDATE project_images SET is_cover = 1 WHERE id = ?').run(saved[0].id);
-    db.prepare('UPDATE projects SET cover_image = ? WHERE id = ?').run(saved[0].filename, project.id);
-  }
+// Update image alt text / caption
+router.patch(
+  '/:imageId',
+  requireAdmin,
+  [
+    body('alt_text')
+      .optional()
+      .isLength({ max: 200 }),
 
-  res.status(201).json(db.prepare('SELECT * FROM project_images WHERE project_id = ? ORDER BY display_order ASC').all(project.id));
-});
+    body('caption')
+      .optional()
+      .isLength({ max: 300 })
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
 
-router.patch('/:imageId', requireAdmin, [body('alt_text').optional().isLength({ max: 200 }), body('caption').optional().isLength({ max: 300 })], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: 'Alt text or caption is too long.' });
-  const clean = sanitizeFields(req.body, ['alt_text', 'caption']);
-  const result = db
-    .prepare(
-      'UPDATE project_images SET alt_text = COALESCE(@alt_text, alt_text), caption = COALESCE(@caption, caption) WHERE id = @id AND project_id = @projectId'
-    )
-    .run({ ...clean, id: req.params.imageId, projectId: req.params.projectId });
-  if (result.changes === 0) return res.status(404).json({ error: 'Image not found.' });
-  res.json(db.prepare('SELECT * FROM project_images WHERE id = ?').get(req.params.imageId));
-});
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'Alt text or caption is too long.'
+        });
+      }
 
-router.put('/:imageId/cover', requireAdmin, (req, res) => {
-  const image = db.prepare('SELECT * FROM project_images WHERE id = ? AND project_id = ?').get(req.params.imageId, req.params.projectId);
-  if (!image) return res.status(404).json({ error: 'Image not found.' });
-  const tx = db.transaction(() => {
-    db.prepare('UPDATE project_images SET is_cover = 0 WHERE project_id = ?').run(req.params.projectId);
-    db.prepare('UPDATE project_images SET is_cover = 1 WHERE id = ?').run(image.id);
-    db.prepare('UPDATE projects SET cover_image = ? WHERE id = ?').run(image.filename, req.params.projectId);
-  });
-  tx();
-  res.json({ ok: true });
-});
+      const clean = sanitizeFields(
+        req.body,
+        ['alt_text', 'caption']
+      );
 
-router.put('/reorder', requireAdmin, [body('order').isArray({ min: 1 })], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: 'An order array of image ids is required.' });
-  const update = db.prepare('UPDATE project_images SET display_order = ? WHERE id = ? AND project_id = ?');
-  const tx = db.transaction((ids) => {
-    ids.forEach((id, idx) => update.run(idx, id, req.params.projectId));
-  });
-  tx(req.body.order);
-  res.json({ ok: true });
-});
+      const result = await db.query(
+        `
+        UPDATE project_images
+        SET
+          alt_text = COALESCE($1, alt_text),
+          caption = COALESCE($2, caption)
+        WHERE id = $3
+          AND project_id = $4
+        RETURNING *
+        `,
+        [
+          clean.alt_text ?? null,
+          clean.caption ?? null,
+          req.params.imageId,
+          req.params.projectId
+        ]
+      );
 
-router.delete('/:imageId', requireAdmin, (req, res) => {
-  const image = db.prepare('SELECT * FROM project_images WHERE id = ? AND project_id = ?').get(req.params.imageId, req.params.projectId);
-  if (!image) return res.status(404).json({ error: 'Image not found.' });
-  db.prepare('DELETE FROM project_images WHERE id = ?').run(image.id);
-  deleteImageFile(SUBDIR, image.filename.split('/').pop());
-  if (image.is_cover) {
-    const next = db.prepare('SELECT * FROM project_images WHERE project_id = ? ORDER BY display_order ASC LIMIT 1').get(req.params.projectId);
-    if (next) {
-      db.prepare('UPDATE project_images SET is_cover = 1 WHERE id = ?').run(next.id);
-      db.prepare('UPDATE projects SET cover_image = ? WHERE id = ?').run(next.filename, req.params.projectId);
-    } else {
-      db.prepare('UPDATE projects SET cover_image = ? WHERE id = ?').run('', req.params.projectId);
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          error: 'Image not found.'
+        });
+      }
+
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error('Update project image error:', error);
+
+      res.status(500).json({
+        error: 'Failed to update image.'
+      });
     }
   }
-  res.json({ ok: true });
-});
+);
+
+// Set image as cover
+router.put(
+  '/:imageId/cover',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const image = await db.get(
+        `
+        SELECT *
+        FROM project_images
+        WHERE id = $1
+          AND project_id = $2
+        `,
+        [
+          req.params.imageId,
+          req.params.projectId
+        ]
+      );
+
+      if (!image) {
+        return res.status(404).json({
+          error: 'Image not found.'
+        });
+      }
+
+      await db.transaction(async (client) => {
+        await client.query(
+          `
+          UPDATE project_images
+          SET is_cover = 0
+          WHERE project_id = $1
+          `,
+          [req.params.projectId]
+        );
+
+        await client.query(
+          `
+          UPDATE project_images
+          SET is_cover = 1
+          WHERE id = $1
+          `,
+          [image.id]
+        );
+
+        await client.query(
+          `
+          UPDATE projects
+          SET cover_image = $1
+          WHERE id = $2
+          `,
+          [
+            image.filename,
+            req.params.projectId
+          ]
+        );
+      });
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('Set project cover error:', error);
+
+      res.status(500).json({
+        error: 'Failed to set cover image.'
+      });
+    }
+  }
+);
+
+// Reorder images
+router.put(
+  '/reorder',
+  requireAdmin,
+  [
+    body('order').isArray({ min: 1 })
+  ],
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'An order array of image ids is required.'
+        });
+      }
+
+      await db.transaction(async (client) => {
+        for (let idx = 0; idx < req.body.order.length; idx++) {
+          await client.query(
+            `
+            UPDATE project_images
+            SET display_order = $1
+            WHERE id = $2
+              AND project_id = $3
+            `,
+            [
+              idx,
+              req.body.order[idx],
+              req.params.projectId
+            ]
+          );
+        }
+      });
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('Reorder project images error:', error);
+
+      res.status(500).json({
+        error: 'Failed to reorder images.'
+      });
+    }
+  }
+);
+
+// Delete image
+router.delete(
+  '/:imageId',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const image = await db.get(
+        `
+        SELECT *
+        FROM project_images
+        WHERE id = $1
+          AND project_id = $2
+        `,
+        [
+          req.params.imageId,
+          req.params.projectId
+        ]
+      );
+
+      if (!image) {
+        return res.status(404).json({
+          error: 'Image not found.'
+        });
+      }
+
+      await db.query(
+        `
+        DELETE FROM project_images
+        WHERE id = $1
+        `,
+        [image.id]
+      );
+
+      deleteImageFile(
+        SUBDIR,
+        image.filename.split('/').pop()
+      );
+
+      // If deleted image was the cover,
+      // make the next image the new cover.
+      if (image.is_cover) {
+        const next = await db.get(
+          `
+          SELECT *
+          FROM project_images
+          WHERE project_id = $1
+          ORDER BY display_order ASC
+          LIMIT 1
+          `,
+          [req.params.projectId]
+        );
+
+        if (next) {
+          await db.query(
+            `
+            UPDATE project_images
+            SET is_cover = 1
+            WHERE id = $1
+            `,
+            [next.id]
+          );
+
+          await db.query(
+            `
+            UPDATE projects
+            SET cover_image = $1
+            WHERE id = $2
+            `,
+            [
+              next.filename,
+              req.params.projectId
+            ]
+          );
+        } else {
+          await db.query(
+            `
+            UPDATE projects
+            SET cover_image = ''
+            WHERE id = $1
+            `,
+            [req.params.projectId]
+          );
+        }
+      }
+
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('Delete project image error:', error);
+
+      res.status(500).json({
+        error: 'Failed to delete image.'
+      });
+    }
+  }
+);
 
 module.exports = router;

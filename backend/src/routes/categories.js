@@ -7,45 +7,129 @@ const { sanitizeFields } = require('../utils/sanitize');
 
 const router = express.Router();
 
-router.get('/', (req, res) => {
-  const rows = db.prepare('SELECT * FROM categories ORDER BY display_order ASC, name ASC').all();
-  res.json(rows);
-});
-
-router.post('/', requireAdmin, [body('name').trim().isLength({ min: 1, max: 80 })], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: 'A category name is required.' });
-
-  const { name } = sanitizeFields(req.body, ['name']);
-  const slug = slugify(name, { lower: true, strict: true });
+router.get('/', async (req, res) => {
   try {
-    const info = db
-      .prepare('INSERT INTO categories (name, slug, display_order) VALUES (?, ?, (SELECT COALESCE(MAX(display_order),0)+1 FROM categories))')
-      .run(name, slug);
-    res.status(201).json(db.prepare('SELECT * FROM categories WHERE id = ?').get(info.lastInsertRowid));
+    const rows = await db.all(
+      'SELECT * FROM categories ORDER BY display_order ASC, name ASC'
+    );
+
+    res.json(rows);
   } catch (e) {
-    res.status(409).json({ error: 'A category with that name already exists.' });
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load categories.' });
   }
 });
 
-router.put('/:id', requireAdmin, [body('name').trim().isLength({ min: 1, max: 80 })], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ error: 'A category name is required.' });
+router.post(
+  '/',
+  requireAdmin,
+  [body('name').trim().isLength({ min: 1, max: 80 })],
+  async (req, res) => {
+    const errors = validationResult(req);
 
-  const { name } = sanitizeFields(req.body, ['name']);
-  const slug = slugify(name, { lower: true, strict: true });
-  const result = db.prepare('UPDATE categories SET name = ?, slug = ? WHERE id = ?').run(name, slug, req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Category not found.' });
-  res.json(db.prepare('SELECT * FROM categories WHERE id = ?').get(req.params.id));
-});
+    if (!errors.isEmpty()) {
+      return res
+        .status(400)
+        .json({ error: 'A category name is required.' });
+    }
 
-router.delete('/:id', requireAdmin, (req, res) => {
-  const inUse = db.prepare('SELECT COUNT(*) AS c FROM projects WHERE category_id = ?').get(req.params.id);
-  if (inUse.c > 0) {
-    return res.status(409).json({ error: `Cannot delete: ${inUse.c} project(s) still use this category.` });
+    const { name } = sanitizeFields(req.body, ['name']);
+    const slug = slugify(name, { lower: true, strict: true });
+
+    try {
+      const result = await db.query(
+        `
+        INSERT INTO categories (name, slug, display_order)
+        VALUES (
+          $1,
+          $2,
+          (SELECT COALESCE(MAX(display_order), 0) + 1 FROM categories)
+        )
+        RETURNING *
+        `,
+        [name, slug]
+      );
+
+      res.status(201).json(result.rows[0]);
+    } catch (e) {
+      console.error(e);
+
+      res
+        .status(409)
+        .json({ error: 'A category with that name already exists.' });
+    }
   }
-  db.prepare('DELETE FROM categories WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
+);
+
+router.put(
+  '/:id',
+  requireAdmin,
+  [body('name').trim().isLength({ min: 1, max: 80 })],
+  async (req, res) => {
+    const errors = validationResult(req);
+
+    if (!errors.isEmpty()) {
+      return res
+        .status(400)
+        .json({ error: 'A category name is required.' });
+    }
+
+    const { name } = sanitizeFields(req.body, ['name']);
+    const slug = slugify(name, { lower: true, strict: true });
+
+    try {
+      const result = await db.query(
+        `
+        UPDATE categories
+        SET name = $1, slug = $2
+        WHERE id = $3
+        RETURNING *
+        `,
+        [name, slug, req.params.id]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: 'Category not found.' });
+      }
+
+      res.json(result.rows[0]);
+    } catch (e) {
+      console.error(e);
+
+      res
+        .status(409)
+        .json({ error: 'A category with that name already exists.' });
+    }
+  }
+);
+
+router.delete('/:id', requireAdmin, async (req, res) => {
+  try {
+    const inUse = await db.get(
+      'SELECT COUNT(*) AS c FROM projects WHERE category_id = $1',
+      [req.params.id]
+    );
+
+    if (Number(inUse.c) > 0) {
+      return res.status(409).json({
+        error: `Cannot delete: ${inUse.c} project(s) still use this category.`,
+      });
+    }
+
+    const result = await db.run(
+      'DELETE FROM categories WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to delete category.' });
+  }
 });
 
 module.exports = router;
