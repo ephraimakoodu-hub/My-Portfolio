@@ -23,21 +23,28 @@ function buildHelmet() {
 }
 
 function buildCors() {
-  const allowed = (process.env.FRONTEND_URL || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const allowed = [
+    'http://localhost:5173',
+    'https://my-portfolio-two-taupe-48.vercel.app',
+    ...(process.env.FRONTEND_URL || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  ];
+
   return cors({
     origin(origin, callback) {
-      // Allow same-origin/non-browser requests (no Origin header) and any
-      // explicitly whitelisted frontend origin. No wildcard, ever, because
-      // this API is credentialed (cookies).
       if (!origin || allowed.includes(origin)) {
         return callback(null, true);
       }
+
+      console.log('Blocked CORS origin:', origin);
       return callback(new Error('Origin not allowed by CORS policy.'));
     },
+
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'X-CSRF-Token'],
   });
 }
-
 module.exports = { buildHelmet, buildCors };
